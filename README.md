@@ -18,7 +18,7 @@ composer require --prefer-dist fr05t1k/esia
 Или добавьте в composer.json
 
 ```
-"fr05t1k/esia" : "^2.0"
+"pavelmgn/esia" : "^2.0"
 ```
 
 # Как использовать 
