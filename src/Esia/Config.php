@@ -18,6 +18,10 @@ class Config
     private $logoutUrlPath = 'idp/ext/Logout';
     private $privateKeyPassword = '';
 
+    private $tokenUrlPath_V3 = 'aas/oauth2/v3/te'; 
+    private $codeUrlPath_V2 = 'aas/oauth2/v2/ac'; 
+    protected $ESIACertSHA1 = '20ad21785b9161ef46f075d4dc23c34e1e349228';
+    
     private $scope = [
         'fullname',
         'birthdate',
@@ -142,6 +146,11 @@ class Config
         return $this->token;
     }
 
+    public function getTokenUrl_V3(): string 
+    {
+        return $this->portalUrl . $this->tokenUrlPath_V3; 
+    }
+
     public function setToken(string $token): void
     {
         $this->token = $token;
@@ -163,6 +172,11 @@ class Config
     public function getTokenUrl(): string
     {
         return $this->portalUrl . $this->tokenUrlPath;
+    }
+    
+    public function getTokenUrl_V2(): string
+    {
+        return $this->portalUrl . $this->codeUrlPath_V2;
     }
 
     /**
