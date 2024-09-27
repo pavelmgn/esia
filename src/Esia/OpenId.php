@@ -8,6 +8,7 @@ use Esia\Exceptions\RequestFailException;
 use Esia\Http\GuzzleHttpClient;
 use Esia\Signer\Exceptions\CannotGenerateRandomIntException;
 use Esia\Signer\Exceptions\SignFailException;
+use Esia\Signer\SignerCPDataHash;
 use Esia\Signer\SignerInterface;
 use Esia\Signer\SignerPKCS7;
 use Exception;
@@ -44,9 +45,10 @@ class OpenId
     /**
      * Config
      *
-     * @var Config
+     * @var Config $config
      */
     private $config;
+    protected $clientCertHash = null;
 
     public function __construct(Config $config, ClientInterface $client = null)
     {
@@ -116,6 +118,40 @@ class OpenId
         return sprintf($url, $request);
     }
 
+    public function buildUrl_V2()
+    {
+        $timestamp = $this->getTimeStamp();
+        $state = $this->buildState();
+        // собираем client_secret по новым правилам
+        $message =  $this->config->getClientId()
+            . $this->config->getScopeString()
+            . $timestamp
+            . $state
+            . $this->config->getRedirectUrl();
+        // используем алгоритм ГОСТ2012 для подписания     
+        $this->signer = new SignerCPDataHash(
+            $config->getCertPath(),           // для КриптоПро эти 
+            $config->getPrivateKeyPath(),     // параметры не нужны
+            $config->getPrivateKeyPassword(), // потому что сертификат и ключ
+            $config->getTmpPath()             // импортированы в хранилище
+        );
+        $clientSecret = $this->signer->sign($message);
+        $url = $this->config->getCodeUrl_V2() . '?%s';
+        $params = [
+            'client_id' => $this->config->getClientId(),
+            'client_secret' => $clientSecret,
+            'redirect_uri' => $this->config->getRedirectUrl(),
+            'scope' => $this->config->getScopeString(),
+            'response_type' => $this->config->getResponseType(),
+            'state' => $state,
+            'access_type' => $this->config->getAccessType(),
+            'timestamp' => $timestamp,
+            'client_certificate_hash' => $this->clientCertHash, // ГОСТ-хэш нашего сертификата     
+        ];
+        $request = http_build_query($params);
+        return sprintf($url, $request);
+    }
+
     /**
      * Return an url for logout
      */
@@ -148,9 +184,9 @@ class OpenId
 
         $clientSecret = $this->signer->sign(
             $this->config->getScopeString()
-            . $timestamp
-            . $this->config->getClientId()
-            . $state
+                . $timestamp
+                . $this->config->getClientId()
+                . $state
         );
 
         $body = [
@@ -319,7 +355,8 @@ class OpenId
             $prev = $e->getPrevious();
 
             // Only for Guzzle
-            if ($prev instanceof BadResponseException
+            if (
+                $prev instanceof BadResponseException
                 && $prev->getResponse() !== null
                 && $prev->getResponse()->getStatusCode() === 403
             ) {
@@ -373,5 +410,93 @@ class OpenId
         $base64 = strtr($string, '-_', '+/');
 
         return base64_decode($base64);
+    }
+
+    public function getToken_V3(string $code): string
+    {
+        $timestamp = $this->getTimeStamp();
+        $state = $this->buildState();
+
+        $this->signer = new SignerCPDataHash(
+            $config->getCertPath(),
+            $config->getPrivateKeyPath(),
+            $config->getPrivateKeyPassword(),
+            $config->getTmpPath()
+        );
+
+        $clientSecret = $this->signer->sign(
+              $this->config->getClientId()
+            . $this->config->getScopeString()
+            . $timestamp
+            . $state
+            . $this->config->getRedirectUrl()
+        );
+
+        $body = [
+            'client_id' => $this->config->getClientId(),
+            'code' => $code,
+            'grant_type' => 'authorization_code',
+            'client_secret' => $clientSecret,
+            'state' => $state,
+            'redirect_uri' => $this->config->getRedirectUrl(),
+            'scope' => $this->config->getScopeString(),
+            'timestamp' => $timestamp,
+            'token_type' => 'Bearer',
+            'refresh_token' => $state,
+            'client_certificate_hash' => $this->clientCertHash,
+        ];
+
+        $payload = $this->sendRequest(
+            new Request(
+                'POST',
+                $this->config->getTokenUrl_V3(),
+                [
+                    'Content-Type' => 'application/x-www-form-urlencoded',
+                ],
+                http_build_query($body)
+            )
+        );
+
+        $this->logger->debug('Payload: ', $payload);
+
+        $token = $payload['access_token'];
+
+        $chunks = explode('.', $token);
+        $payload = json_decode($this->base64UrlSafeDecode($chunks[1]), true);
+        $header = json_decode($this->base64UrlSafeDecode($chunks[0]), true);
+        $_token_signature  = $this->base64UrlSafeDecode($chunks[2]);
+
+        if ('JWT'==$header->typ) {
+            $store = new \CPStore();            
+            $store->Open(CURRENT_USER_STORE, "Users", STORE_OPEN_READ_ONLY); // используем хранилище Users
+            $certs = $store->get_Certificates();
+            $certlist = $certs->Find(CERTIFICATE_FIND_SHA1_HASH, $this->ESIACertSHA1, 0); // ищем в хранилище сертификат ЕСИА по его sha1 хэшу
+            $cert = $certlist->Item(1);
+            if (!$cert) {
+                 throw new CannotReadCertificateException('Cannot read the certificate');
+            }              
+            
+            $hd = new \CPHashedData();        
+            $hd->set_DataEncoding(BASE64_TO_BINARY);
+            switch ($header->alg) {
+               case 'GOST3410_2012_256':
+                   $hd->set_Algorithm(CADESCOM_HASH_ALGORITHM_CP_GOST_3411_2012_256);
+                   break; 
+               case 'GOST3410_2012_512':
+                   $hd->set_Algorithm(CADESCOM_HASH_ALGORITHM_CP_GOST_3411_2012_512);
+                   break;             
+               default:
+                   throw new Exception('Invalid signature algorithm');    
+            }
+            $hd->Hash(base64_encode($chunks[0].'.'.$chunks[1]));        
+            $rs = new \CPRawSignature();
+            $rs->VerifyHash($hd, bin2hex(strrev($_token_signature)), $cert);
+
+            //если попали на эту строчку, значит подпись валидная. Иначе бы уже было вызвано исключение.
+            $this->config->setOid($payload['urn:esia:sbj_id']);  
+            $this->config->setToken($token);
+        } // JWT token
+
+        return $token;
     }
 }
